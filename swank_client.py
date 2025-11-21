@@ -7,11 +7,12 @@ import queue
 import logging
 import os
 from pathlib import Path
+import re
 
 # --- Constants ---
 ABORT = (None, None)
 MAXIMUM_THREAD_COUNT = 10000
-SLIME_PROTOCOL_VERSION = "20210223"  # Пример, может отличаться
+SLIME_PROTOCOL_VERSION = "20210223"
 
 # --- Global Variables ---
 THREAD_OFFSET = 0
@@ -49,6 +50,160 @@ def read_string_from_socket(sock, length):
         data += chunk
     return data
 
+# --- Lisp S-expression Serialization Helper ---
+
+def escape_lisp_string(s):
+    """Escapes quotes and backslashes in a string for Lisp."""
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+def serialize_lisp_item(item):
+    """
+    Serializes a single Lisp item with proper handling of symbols vs strings.
+    """
+    if item is None:
+        return "nil"
+    elif item is True:
+        return "t"
+    elif item is False:
+        return "nil"
+    elif isinstance(item, str):
+        # Check if it's a keyword (starts with colon)
+        if item.startswith(':'):
+            return item
+        # Check if it's a symbol (simple identifier)
+        elif re.match(r'^[a-zA-Z0-9_\-+*/=<>!?&%$#@~\.:]+$', item) and not item[0].isdigit():
+            # Для стандартных функций Common Lisp используем CL: префикс
+            common_lisp_symbols = {
+                '+', '-', '*', '/', 'format', 'list', 'cons', 'car', 'cdr',
+                'eq', 'equal', 'defun', 'defparameter', 'setq', 'let', 'if',
+                'progn', 'princ', 'print', 'terpri'
+            }
+            if item in common_lisp_symbols:
+                return f"CL:{item}"
+            else:
+                return item
+        else:
+            # It's a string literal - needs quotes and escaping
+            escaped_item = escape_lisp_string(item)
+            return f'"{escaped_item}"'
+    elif isinstance(item, (int, float)):
+        return str(item)
+    elif isinstance(item, list):
+        return serialize_lisp_list(item)
+    else:
+        # Fallback for other types
+        return str(item)
+
+def serialize_lisp_list(items):
+    """Serializes a list of items into a Lisp list string."""
+    elements = [serialize_lisp_item(item) for item in items]
+    return f"({' '.join(elements)})"
+
+# --- Advanced Lisp S-expression Parser ---
+
+def parse_lisp_string(s):
+    """
+    A robust Lisp s-expression parser that handles nested structures and strings properly.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    
+    def tokenize(s):
+        """Tokenize the input string into Lisp tokens."""
+        tokens = []
+        i = 0
+        n = len(s)
+        
+        while i < n:
+            if s[i] in ' \t\n':
+                i += 1
+                continue
+            elif s[i] == '(':
+                tokens.append('(')
+                i += 1
+            elif s[i] == ')':
+                tokens.append(')')
+                i += 1
+            elif s[i] == '"':
+                # Parse string
+                j = i + 1
+                while j < n and not (s[j] == '"' and s[j-1] != '\\'):
+                    j += 1
+                if j < n:
+                    tokens.append(s[i:j+1])
+                    i = j + 1
+                else:
+                    tokens.append(s[i:])
+                    i = n
+            else:
+                # Parse atom
+                j = i
+                while j < n and s[j] not in ' \t\n()"':
+                    j += 1
+                tokens.append(s[i:j])
+                i = j
+        
+        return tokens
+    
+    def parse_tokens(tokens):
+        """Parse tokens into Lisp data structures."""
+        if not tokens:
+            return None, tokens
+        
+        token = tokens[0]
+        if token == '(':
+            # Parse list
+            lst = []
+            tokens = tokens[1:]  # Skip '('
+            while tokens and tokens[0] != ')':
+                item, tokens = parse_tokens(tokens)
+                if item is not None:
+                    lst.append(item)
+            if tokens and tokens[0] == ')':
+                tokens = tokens[1:]  # Skip ')'
+            return lst, tokens
+        elif token == ')':
+            raise SyntaxError("Unexpected ')'")
+        else:
+            # Parse atom
+            return parse_atom(token), tokens[1:]
+    
+    def parse_atom(token):
+        """Parse a single token into a Lisp atom."""
+        if token == 'nil':
+            return None
+        elif token == 't':
+            return True
+        elif token.startswith('"') and token.endswith('"'):
+            # String
+            content = token[1:-1]
+            # Handle escape sequences
+            content = content.replace('\\"', '"').replace('\\\\', '\\')
+            return content
+        elif token.startswith(':'):
+            # Keyword
+            return token
+        else:
+            # Number or symbol
+            try:
+                return int(token)
+            except ValueError:
+                try:
+                    return float(token)
+                except ValueError:
+                    return token
+    
+    try:
+        tokens = tokenize(s)
+        result, remaining = parse_tokens(tokens)
+        if remaining:
+            logger.warning(f"Not all tokens were parsed. Remaining: {remaining}")
+        return result
+    except Exception as e:
+        logger.error(f"Error parsing Lisp string: {s}, error: {e}")
+        return None
+
 # --- Main Classes ---
 
 class SwankConnection:
@@ -75,10 +230,12 @@ class SwankConnection:
     def _slime_net_send(self, sexp):
         """Sends SEXP to the Swank server over the socket."""
         try:
-            payload = json.dumps(sexp)
+            # Use the corrected serialization
+            payload = serialize_lisp_list(sexp)
+            logger.debug(f"Sending: {payload}")
+            
             utf8_payload = payload.encode('utf-8')
-            # The payload includes an encoded newline character at the end.
-            payload_length = len(utf8_payload) + 1
+            payload_length = len(utf8_payload) + 1  # +1 for newline
             hex_length = self._slime_net_encode_length(payload_length)
             utf8_length = hex_length.encode('utf-8')
 
@@ -86,31 +243,49 @@ class SwankConnection:
             self.usocket.sendall(message)
         except socket.error as e:
             logger.error(f"Network error in _slime_net_send: {e}")
-            raise # Let caller handle network errors
+            raise
 
     def slime_send(self, sexp):
         """Sends SEXP to the Swank server using the connection."""
         self._slime_net_send(sexp)
-        try:
-            self.usocket.flush() # Force output
-        except socket.error as e:
-            logger.error(f"Network error flushing output in slime_send: {e}")
-            raise
 
     def _slime_net_read(self):
-        """Reads a Swank message from the network connection."""
+        """Reads a Swank message from the network connection using Lisp parser."""
         try:
-            length_hex = read_string_from_socket(self.usocket, 6).decode('utf-8')
+            # Read length (6 bytes)
+            length_data = read_string_from_socket(self.usocket, 6)
+            length_hex = length_data.decode('utf-8', errors='ignore')
+            
+            # Validate hex string
+            if not all(c in '0123456789ABCDEF' for c in length_hex):
+                logger.error(f"Invalid length hex: {length_hex}")
+                return None
+                
             length = int(length_hex, 16)
-            message_str = read_string_from_socket(self.usocket, length - 1).decode('utf-8')
-            # Last byte is newline, already consumed by length
-            return json.loads(message_str)
-        except (socket.error, json.JSONDecodeError, ValueError, EOFError) as e:
+            if length <= 0:
+                logger.error(f"Invalid message length: {length}")
+                return None
+                
+            # Read message body (length bytes, which includes the newline)
+            message_data = read_string_from_socket(self.usocket, length)
+            message_str = message_data.decode('utf-8', errors='ignore')
+            
+            # Parse as Lisp s-expression
+            parsed = parse_lisp_string(message_str)
+            logger.debug(f"Received raw: {message_str}")
+            logger.debug(f"Received parsed: {parsed}")
+            return parsed
+            
+        except (socket.error, ValueError, EOFError, UnicodeDecodeError) as e:
             logger.error(f"Error reading message: {e}")
-            return None # Signal error to dispatcher
+            return None
 
     def _slime_dispatch_event(self, event):
         """Handles EVENT for this Swank CONNECTION."""
+        if event is None:
+            logger.warning("Received None event in _slime_dispatch_event, skipping.")
+            return
+
         # Define handlers for different event types
         handlers = {
             ":return": self._handle_return,
@@ -132,21 +307,17 @@ class SwankConnection:
             ":reader-error": self._handle_reader_error,
             ":invalid-rpc": self._handle_invalid_rpc,
             ":emacs-skipped-packet": self._handle_emacs_skipped_packet,
+            ":emacs-rex": self._handle_emacs_rex,
         }
-
-        # Special handling for :emacs-rex which originates from this client
-        if isinstance(event, list) and len(event) > 0 and event[0] == ":emacs-rex":
-            self._handle_emacs_rex(event[1:])
-            return
 
         destructure_case(event, handlers)
 
-    def _handle_emacs_rex(self, args):
-        # args = [form, package_name, thread, continuation]
-        # This is handled by slime_eval_async/slime_eval when sending
-        pass
+    def _handle_emacs_rex(self, form, package_name, thread, continuation_id):
+        """Handle :emacs-rex events - send form to server for evaluation."""
+        logger.info(f"Emacs REX: Form={form}, Package={package_name}, Thread={thread}, ID={continuation_id}")
 
     def _handle_return(self, value, msg_id):
+        logger.info(f"Return: value={value}, msg_id={msg_id}")
         with self.connection_lock:
             if msg_id in self.rex_continuations:
                 continuation = self.rex_continuations.pop(msg_id)
@@ -168,69 +339,53 @@ class SwankConnection:
                 else:
                     logger.warning(f"Received :return for unknown id: {msg_id}")
 
-
     def _handle_debug_activate(self, thread_id, level, select=None):
         # Modify thread ID to be unique across connections
         unique_thread_id = thread_id + self.thread_offset
         logger.info(f"Debug Activate: Thread {unique_thread_id}, Level {level}, Select {select}")
-        # Forward to Emacs (placeholder)
-        # send_to_emacs([":debug-activate", unique_thread_id, level, select])
 
-    def _handle_debug(self, thread_id, level, condition, restarts, frames, continuations):
+    def _handle_debug(self, thread_id, level, condition, *args):
+        """Handle debug events with variable number of arguments."""
         unique_thread_id = thread_id + self.thread_offset
         logger.info(f"Debug: Thread {unique_thread_id}, Level {level}, Condition: {condition}")
-        # Forward to Emacs (placeholder)
-        # send_to_emacs([":debug", unique_thread_id, level, condition, restarts, frames, continuations])
+        logger.info(f"Debug args: {args}")
 
     def _handle_debug_return(self, thread_id, level, stepping):
         unique_thread_id = thread_id + self.thread_offset
         logger.info(f"Debug Return: Thread {unique_thread_id}, Level {level}, Stepping: {stepping}")
-        # Forward to Emacs (placeholder)
-        # send_to_emacs([":debug-return", unique_thread_id, level, stepping])
 
     def _handle_channel_send(self, channel_id, msg):
         logger.info(f"Channel Send: ID {channel_id}, Message: {msg}")
-        # print([":channel-send", channel_id, msg])
 
     def _handle_read_from_minibuffer(self, thread_id, tag, prompt, initial_value):
         logger.info(f"Read from Minibuffer: Thread {thread_id}, Tag {tag}, Prompt: {prompt}")
-        # print([":read-from-minibuffer", thread_id, tag, prompt, initial_value])
 
     def _handle_y_or_n_p(self, thread_id, tag, question):
         logger.info(f"Y or N: Thread {thread_id}, Tag {tag}, Question: {question}")
-        # print([":y-or-n-p", thread_id, tag, question])
 
     def _handle_eval_no_wait(self, form):
         logger.info(f"Eval No Wait: {form}")
-        # print([":eval-no-wait", form])
 
     def _handle_eval(self, thread_id, tag, form_string):
         logger.info(f"Eval: Thread {thread_id}, Tag {tag}, Form: {form_string}")
-        # print([":eval", thread_id, tag, form_string])
 
     def _handle_ed_rpc_no_wait(self, function_name, *args):
         logger.info(f"ED RPC No Wait: {function_name}, Args: {args}")
-        # print([":ed-rpc-no-wait", function_name] + list(args))
 
     def _handle_ed_rpc(self, thread_id, tag, function_name, *args):
         logger.info(f"ED RPC: Thread {thread_id}, Tag {tag}, Function: {function_name}, Args: {args}")
-        # print([":ed-rpc", thread_id, tag, function_name] + list(args))
 
     def _handle_ed(self, what):
         logger.info(f"Ed: {what}")
-        # print([":ed", what])
 
     def _handle_inspect(self, what, wait_thread, wait_tag):
         logger.info(f"Inspect: {what}, Wait Thread: {wait_thread}, Wait Tag: {wait_tag}")
-        # print([":inspect", what, wait_thread, wait_tag])
 
     def _handle_background_message(self, message):
         logger.info(f"Background Message: {message}")
-        # print([":background-message", message])
 
     def _handle_debug_condition(self, thread_id, message):
         logger.info(f"Debug Condition: Thread {thread_id}, Message: {message}")
-        # print([":debug-condition", thread_id, message])
 
     def _handle_ping(self, thread_id, tag):
         logger.info(f"Ping: Thread {thread_id}, Tag {tag}")
@@ -242,20 +397,20 @@ class SwankConnection:
 
     def _handle_reader_error(self, packet, condition):
         logger.error(f"Reader Error: Packet {packet}, Condition: {condition}")
-        # print([":reader-error", packet, condition])
-        # Optionally raise an error or handle gracefully
-        # raise ValueError("Invalid protocol message")
 
     def _handle_invalid_rpc(self, msg_id, message):
         logger.error(f"Invalid RPC: ID {msg_id}, Message: {message}")
         with self.connection_lock:
-            self.rex_continuations.pop(msg_id, None) # Remove if exists
-            self.eval_events.pop(msg_id, None) # Remove sync eval state if exists
-        # print([":invalid-rpc", msg_id, message])
+            # For sync evals, set the result to an exception
+            if msg_id in self.eval_events:
+                self.eval_results[msg_id] = RuntimeError(f"Invalid RPC: {message}")
+                self.eval_events[msg_id].set()
+            # Remove from continuations
+            self.rex_continuations.pop(msg_id, None)
+            self.eval_events.pop(msg_id, None)
 
     def _handle_emacs_skipped_packet(self, packet):
         logger.info(f"Emacs Skipped Packet: {packet}")
-        # print([":emacs-skipped-packet", packet])
 
     def _slime_dispatch_events_loop(self):
         """Main loop for reading and dispatching events in a thread."""
@@ -298,7 +453,8 @@ class SwankConnection:
                 self.rex_continuations[msg_id] = continuation
 
         try:
-            self.slime_send([":emacs-rex", sexp, "COMMON-LISP-USER", 1, msg_id])
+            # Use "CL-USER" package and "T" for current thread
+            self.slime_send([":emacs-rex", sexp, "CL-USER", "T", msg_id])
         except Exception as e:
             logger.error(f"Network error in slime_eval_async: {e}")
             # Clean up continuation if send failed
@@ -309,13 +465,13 @@ class SwankConnection:
     def slime_eval(self, sexp):
         """Sends SEXP for sync evaluation and waits for the result."""
         msg_id = None
-        result_queue = queue.Queue()
         event = threading.Event()
 
         def sync_continuation(result_tuple):
             # result_tuple is (:ok value) or (:abort condition)
-            result_queue.put(result_tuple)
-            event.set()
+            with self.connection_lock:
+                self.eval_results[msg_id] = result_tuple
+                self.eval_events[msg_id].set()
 
         with self.connection_lock:
             if self.state != 'alive':
@@ -324,29 +480,47 @@ class SwankConnection:
             self.continuation_counter += 1
             # Store event and queue for sync eval
             self.eval_events[msg_id] = event
-            self.eval_results[msg_id] = None # Placeholder
+            self.eval_results[msg_id] = None
+            # Register continuation for async response handling
+            self.rex_continuations[msg_id] = sync_continuation
 
         try:
-            self.slime_send([":emacs-rex", sexp, "COMMON-LISP-USER", 1, msg_id])
+            # Use "CL-USER" package and "T" for current thread
+            self.slime_send([":emacs-rex", sexp, "CL-USER", "T", msg_id])
         except Exception as e:
             logger.error(f"Network error in slime_eval: {e}")
             # Clean up state if send failed
             with self.connection_lock:
                 self.eval_events.pop(msg_id, None)
                 self.eval_results.pop(msg_id, None)
+                self.rex_continuations.pop(msg_id, None)
             raise
 
         # Wait for the event to be set by _handle_return
-        event.wait()
+        event.wait(timeout=30.0)  # 30 second timeout
+        
         # Retrieve result
-        result = self.eval_results.pop(msg_id)
-        self.eval_events.pop(msg_id, None) # Cleanup event
+        with self.connection_lock:
+            if not event.is_set():
+                raise TimeoutError("Evaluation timed out")
+                
+            result_tuple = self.eval_results.pop(msg_id)
+            self.eval_events.pop(msg_id, None)
+            self.rex_continuations.pop(msg_id, None)
 
-        if isinstance(result, tuple) and result[0] == 'ok':
-            return result[1]
-        else:
-            # Assuming result is (:abort condition) or similar error tuple
-            raise RuntimeError(f"Evaluation aborted or error: {result}")
+        if result_tuple is None:
+            raise RuntimeError("Evaluation failed with no result")
+            
+        if isinstance(result_tuple, Exception):
+            raise result_tuple
+            
+        if isinstance(result_tuple, (list, tuple)) and len(result_tuple) > 0:
+            if result_tuple[0] == ':ok':
+                return result_tuple[1] if len(result_tuple) > 1 else result_tuple[0]
+            elif result_tuple[0] == ':abort':
+                raise RuntimeError(f"Evaluation aborted: {result_tuple[1]}")
+        
+        return result_tuple
 
 
 def add_open_connection(connection):
@@ -355,7 +529,8 @@ def add_open_connection(connection):
 
 def remove_open_connection(connection):
     with CONNECTIONS_LOCK:
-        OPEN_CONNECTIONS.remove(connection)
+        if connection in OPEN_CONNECTIONS:
+            OPEN_CONNECTIONS.remove(connection)
 
 def find_connection_for_thread_id(thread_id):
     """Finds the connection associated with a given thread ID."""
@@ -382,8 +557,7 @@ def slime_secret():
 def socket_keep_alive(sock):
     """Configures TCP keep alive for the socket."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # Platform-specific options might be needed, similar to the Lisp code
-    # Example for Linux (values are illustrative)
+    # Platform-specific options
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
@@ -416,7 +590,9 @@ def slime_connect(host_name, port, connection_closed_hook=None):
     secret = slime_secret()
     if secret:
         try:
-            connection.slime_send(secret)
+            # Send secret as a string literal
+            secret_payload = f'"{escape_lisp_string(secret)}"'
+            connection._slime_net_send(secret_payload)
         except Exception as e:
             logger.error(f"Failed to send secret: {e}")
             connection._cleanup()
@@ -426,7 +602,7 @@ def slime_connect(host_name, port, connection_closed_hook=None):
     connection.dispatch_thread = threading.Thread(
         target=connection._slime_dispatch_events_loop,
         name=f"swank dispatcher for {host_name}/{port}",
-        daemon=True # Dies when main program exits
+        daemon=False
     )
     connection.dispatch_thread.start()
 
@@ -439,33 +615,44 @@ def slime_close(connection):
             connection.state = 'closing'
     # The dispatch loop will detect the state change and exit, triggering cleanup
 
-# --- Example Usage (Wrapped in Context Manager for safety) ---
-# This is a conceptual example. A real context manager would be more complex.
-# class SwankConnectionManager:
-#     def __init__(self, host, port):
-#         self.host = host
-#         self.port = port
-#         self.connection = None
-#
-#     def __enter__(self):
-#         self.connection = slime_connect(self.host, self.port)
-#         if not self.connection:
-#             raise ConnectionError(f"Could not connect to {self.host}:{self.port}")
-#         return self.connection
-#
-#     def __exit__(self, exc_type, exc_val, exc_tb):
-#         if self.connection:
-#             slime_close(self.connection)
+# --- Context Manager for safety ---
+class SwankConnectionManager:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.connection = None
 
-# Example:
-# if __name__ == "__main__":
-#     try:
-#         # conn = slime_connect("localhost", 4005)
-#         with SwankConnectionManager("localhost", 4005) as conn:
-#             if conn:
-#                 result = conn.slime_eval("(+ 1 2)")
-#                 print(f"Result: {result}")
-#                 import time
-#                 time.sleep(10) # Keep alive to see events
-#     except Exception as e:
-#         print(f"Error: {e}")
+    def __enter__(self):
+        self.connection = slime_connect(self.host, self.port)
+        if not self.connection:
+            raise ConnectionError(f"Could not connect to {self.host}:{self.port}")
+        return self.connection
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.connection:
+            slime_close(self.connection)
+            # Wait for cleanup to complete
+            if self.connection.dispatch_thread and self.connection.dispatch_thread.is_alive():
+                self.connection.dispatch_thread.join(timeout=5.0)
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # Enable debug logging for example
+    logging.getLogger().setLevel(logging.DEBUG)
+    
+    try:
+        with SwankConnectionManager("localhost", 4005) as conn:
+            if conn:
+                # Test with CL package functions - use symbols, not strings
+                # Send (+ 1 2) as a proper Lisp form - теперь будет сериализовано как (CL:+ 1 2)
+                result = conn.slime_eval(['+', 1, 2])
+                print(f"Result: {result}")
+                
+                # Test with a string evaluation
+                result2 = conn.slime_eval(['format', 'nil', 'Hello, ~a', 'World'])
+                print(f"Format result: {result2}")
+                
+                import time
+                time.sleep(2) # Keep alive to see events
+    except Exception as e:
+        print(f"Error: {e}")
